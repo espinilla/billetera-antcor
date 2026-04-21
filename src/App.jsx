@@ -30,11 +30,11 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = typeof window !== 'undefined' && window.__app_id ? window.__app_id : 'todomaletines-billetera';
 
-// --- ESTRUCTURA DE BOLSILLOS ---
+// --- ESTRUCTURA DE BOLSILLOS (Nombres simplificados) ---
 const BUCKETS = [
-  { id: 'NEGOCIO_RAFAEL', label: 'NEGOCIO RAFAEL', color: 'bg-[#002A8D]', icon: <Briefcase size={14}/> },
-  { id: 'NEGOCIO_CANO', label: 'NEGOCIO CANO', color: 'bg-orange-500', icon: <Users size={14}/> },
-  { id: 'PERSONAL_RAFAEL', label: 'PERSONAL (GASTOS)', color: 'bg-emerald-600', icon: <Coffee size={14}/> }
+  { id: 'NEGOCIO_CANO', label: 'CANO', color: 'bg-orange-500', icon: <Users size={14}/> },
+  { id: 'NEGOCIO_RAFAEL', label: 'RAFAEL', color: 'bg-[#002A8D]', icon: <Briefcase size={14}/> },
+  { id: 'PERSONAL_RAFAEL', label: 'PERSONAL', color: 'bg-emerald-600', icon: <Coffee size={14}/> }
 ];
 
 const formatMoney = (amount) => {
@@ -51,14 +51,15 @@ const formatDate = (dateString) => {
 export default function BilleteraApp() {
   const [user, setUser] = useState(null);
   const [loadingApp, setLoadingApp] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [transactions, setTransactions] = useState([]);
   const [activeTab, setActiveTab] = useState('home'); 
   const [showForm, setShowForm] = useState(false);
   const [formType, setFormType] = useState('ingreso'); 
-  const [isSyncing, setIsSyncing] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterBucket, setFilterBucket] = useState('ALL'); 
+  const [auditFilterBucket, setAuditFilterBucket] = useState('ALL'); 
   const [auditDate, setAuditDate] = useState(new Date().toISOString().split('T')[0]);
   
   const [formData, setFormData] = useState({ 
@@ -66,7 +67,7 @@ export default function BilleteraApp() {
     entity: '', 
     concept: '', 
     method: 'YAPE', 
-    bucket: 'NEGOCIO_RAFAEL',
+    bucket: 'NEGOCIO_CANO',
     toBucket: 'PERSONAL_RAFAEL' 
   });
 
@@ -77,10 +78,13 @@ export default function BilleteraApp() {
         if (typeof window !== 'undefined' && window.__initial_auth_token) {
           await signInWithCustomToken(auth, window.__initial_auth_token);
         }
-      } catch (e) { console.error(e); }
+      } catch (e) { console.error("Error Auth:", e); }
     };
     initAuth();
-    const unsubscribe = onAuthStateChanged(auth, (u) => { setUser(u); setLoadingApp(false); });
+    const unsubscribe = onAuthStateChanged(auth, (u) => { 
+      setUser(u); 
+      setLoadingApp(false); 
+    });
     return () => unsubscribe();
   }, []);
 
@@ -94,28 +98,27 @@ export default function BilleteraApp() {
       setTransactions(data);
       setIsSyncing(false);
     }, (error) => {
-      console.error(error);
+      console.error("Error Firestore:", error);
       setIsSyncing(false);
     });
   }, [user]);
 
-  // --- CÁLCULOS DE SALDO ACTUAL ---
+  // --- CÁLCULOS DE SALDO ---
   const balances = useMemo(() => {
     return transactions.reduce((acc, tx) => {
       if (tx.status === 'anulado') return acc;
       const amt = parseFloat(tx.amount) || 0;
       const typeAmt = tx.type === 'ingreso' ? amt : -amt;
       const bucket = tx.bucket || 'NEGOCIO_RAFAEL';
-      
       if (bucket === 'NEGOCIO_RAFAEL') acc.rafael += typeAmt;
       if (bucket === 'NEGOCIO_CANO') acc.cano += typeAmt;
       if (bucket === 'PERSONAL_RAFAEL') acc.personal += typeAmt;
-      
       acc.total += typeAmt;
       return acc;
     }, { rafael: 0, cano: 0, personal: 0, total: 0 });
   }, [transactions]);
 
+  // --- FILTRADO DE FLUJO (HOME) ---
   const filteredTransactions = useMemo(() => {
     let base = transactions;
     if (filterBucket !== 'ALL') base = base.filter(tx => (tx.bucket || 'NEGOCIO_RAFAEL') === filterBucket);
@@ -130,8 +133,10 @@ export default function BilleteraApp() {
   const auditResult = useMemo(() => {
     const dayEnd = new Date(auditDate + "T23:59:59-05:00");
     const dayStart = new Date(auditDate + "T00:00:00-05:00");
+    const today = new Date();
+    const isFuture = dayStart > today;
     
-    return transactions.reduce((acc, tx) => {
+    const result = transactions.reduce((acc, tx) => {
       const txDate = new Date(tx.date);
       const bucket = tx.bucket || 'NEGOCIO_RAFAEL';
       const amt = parseFloat(tx.amount) || 0;
@@ -145,61 +150,31 @@ export default function BilleteraApp() {
       }
 
       if (txDate >= dayStart && txDate <= dayEnd) {
-        acc.list.push(tx);
+        if (auditFilterBucket === 'ALL' || bucket === auditFilterBucket) {
+           acc.list.push(tx);
+        }
       }
-
       return acc;
-    }, { 
-      history: { rafael: 0, cano: 0, personal: 0, total: 0 },
-      list: [] 
-    });
-  }, [transactions, auditDate]);
+    }, { history: { rafael: 0, cano: 0, personal: 0, total: 0 }, list: [] });
+
+    return { ...result, isFuture };
+  }, [transactions, auditDate, auditFilterBucket]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     const amt = parseFloat(formData.amount);
     if (isNaN(amt) || amt <= 0 || !user) return;
-
     if (formType === 'transfer' && formData.bucket === formData.toBucket) {
-      alert("Rafael, no puedes transferir al mismo bolsillo de origen.");
+      alert("Rafael, elige cajas distintas para transferir.");
       return;
     }
-
     const txRef = collection(db, 'artifacts', appId, 'users', user.uid, 'billetera_antcor');
-
     try {
       if (formType === 'transfer') {
-        await addDoc(txRef, {
-          type: 'gasto',
-          amount: amt,
-          entity: 'TRANSFERENCIA INTERNA',
-          concept: `MOVIMIENTO A ${formData.toBucket.split('_')[0]}`,
-          method: 'INTERNO',
-          bucket: formData.bucket,
-          status: 'activo',
-          date: new Date().toISOString()
-        });
-        await addDoc(txRef, {
-          type: 'ingreso',
-          amount: amt,
-          entity: 'TRANSFERENCIA INTERNA',
-          concept: `RECIBIDO DE ${formData.bucket.split('_')[0]}`,
-          method: 'INTERNO',
-          bucket: formData.toBucket,
-          status: 'activo',
-          date: new Date().toISOString()
-        });
+        await addDoc(txRef, { type: 'gasto', amount: amt, entity: 'TRANSFERENCIA', concept: `A ${formData.toBucket.split('_')[1] || formData.toBucket}`, method: 'INTERNO', bucket: formData.bucket, status: 'activo', date: new Date().toISOString() });
+        await addDoc(txRef, { type: 'ingreso', amount: amt, entity: 'TRANSFERENCIA', concept: `DE ${formData.bucket.split('_')[1] || formData.bucket}`, method: 'INTERNO', bucket: formData.toBucket, status: 'activo', date: new Date().toISOString() });
       } else {
-        await addDoc(txRef, {
-          type: formType,
-          amount: amt,
-          entity: formData.entity.toUpperCase(),
-          concept: formData.concept.toUpperCase(),
-          method: formData.method,
-          bucket: formData.bucket,
-          status: 'activo',
-          date: new Date().toISOString()
-        });
+        await addDoc(txRef, { type: formType, amount: amt, entity: formData.entity.toUpperCase(), concept: formData.concept.toUpperCase(), method: formData.method, bucket: formData.bucket, status: 'activo', date: new Date().toISOString() });
       }
       setFormData({ ...formData, amount: '', entity: '', concept: '' });
       setShowForm(false);
@@ -208,12 +183,10 @@ export default function BilleteraApp() {
 
   const toggleAnular = async (id, currentStatus) => {
     if (!user) return;
-    const msg = currentStatus === 'anulado' ? '¿Reactivar este registro?' : '¿Anular este registro? No se borrará del historial.';
+    const msg = currentStatus === 'anulado' ? '¿Reactivar?' : '¿Anular este registro? No se borrará del historial.';
     if (window.confirm(msg)) {
       try {
-        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'billetera_antcor', id), { 
-          status: currentStatus === 'anulado' ? 'activo' : 'anulado'
-        });
+        await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'billetera_antcor', id), { status: currentStatus === 'anulado' ? 'activo' : 'anulado' });
       } catch (error) { alert(error.message); }
     }
   };
@@ -230,8 +203,8 @@ export default function BilleteraApp() {
     <div className="flex h-screen items-center justify-center bg-[#002A8D] p-6 text-center">
       <div className="bg-white p-10 rounded-[3rem] w-full max-w-sm shadow-2xl border-t-8 border-orange-500">
         <Wallet size={64} className="text-[#002A8D] mx-auto mb-4" />
-        <h1 className="text-3xl font-black mb-6 uppercase italic tracking-tighter leading-none">Antcor<br/>Auditor Cloud</h1>
-        <button onClick={() => signInWithPopup(auth, new GoogleAuthProvider())} className="w-full bg-[#002A8D] text-white py-4 rounded-2xl font-bold transition-all active:scale-95 shadow-lg">Entrar con Google</button>
+        <h1 className="text-3xl font-black mb-6 italic tracking-tighter leading-none uppercase">Antcor Cloud</h1>
+        <button onClick={() => signInWithPopup(auth, new GoogleAuthProvider())} className="w-full bg-[#002A8D] text-white py-4 rounded-2xl font-bold shadow-lg active:scale-95 transition-all">Entrar con Google</button>
       </div>
     </div>
   );
@@ -240,13 +213,14 @@ export default function BilleteraApp() {
     <div className="flex justify-center bg-gray-900 min-h-screen font-sans select-none">
       <div className="w-full max-w-md bg-white shadow-2xl relative flex flex-col h-screen overflow-hidden">
         
-        {/* HEADER: SALDOS VIVOS */}
+        {/* HEADER */}
         <div className="bg-[#002A8D] text-white p-5 pb-6 rounded-b-[2.5rem] shadow-lg shrink-0 relative overflow-hidden transition-all">
           <div className="absolute top-0 right-0 w-64 h-64 bg-white/5 rounded-full -translate-y-1/2 translate-x-1/3"></div>
           
           <div className="flex justify-between items-center mb-6 relative">
             <span className="text-[10px] font-black tracking-widest uppercase italic flex items-center gap-2">
-               <ShieldCheck size={16} className="text-green-400" /> Auditoría Multicaja
+               {isSyncing ? <Loader2 size={16} className="animate-spin text-blue-300" /> : <ShieldCheck size={16} className="text-green-400" />} 
+               Auditoría Antcor v8.5
             </span>
             <button onClick={() => setShowProfile(true)} className="w-9 h-9 rounded-full border-2 border-white/20 overflow-hidden bg-white/10 flex items-center justify-center">
               {user?.photoURL ? <img src={user.photoURL} className="w-full h-full object-cover" /> : <UserCircle size={24} />}
@@ -254,50 +228,48 @@ export default function BilleteraApp() {
           </div>
 
           <div className="space-y-2 mb-4">
+             {/* CANO PRINCIPAL */}
              <div className="flex justify-between items-center bg-white/10 p-3 rounded-xl border border-white/5 shadow-inner">
-                <span className="text-[9px] font-black uppercase text-blue-200 flex items-center gap-2 tracking-tighter italic"><Briefcase size={12}/> NEGOCIO RAFAEL</span>
-                <span className="text-xl font-black">{formatMoney(balances.rafael)}</span>
+                <span className="text-[9px] font-black uppercase text-orange-200 flex items-center gap-2 italic"><Users size={12}/> CANO</span>
+                <span className="text-xl font-black">{formatMoney(balances.cano)}</span>
              </div>
+             
              <div className="grid grid-cols-2 gap-2">
                 <div className="bg-white/5 p-3 rounded-xl border border-white/5">
-                  <span className="text-[8px] font-black uppercase text-blue-200 flex items-center gap-1 mb-1 truncate italic"><Users size={10}/> CANO</span>
-                  <span className="text-sm font-black block truncate">{formatMoney(balances.cano)}</span>
+                  <span className="text-[8px] font-black uppercase text-blue-200 flex items-center gap-1 mb-1 truncate italic"><Briefcase size={10}/> RAFAEL</span>
+                  <span className="text-sm font-black block">{formatMoney(balances.rafael)}</span>
                 </div>
                 <div className={`p-3 rounded-xl border transition-all ${balances.personal < 0 ? 'bg-red-500/30 border-red-400' : 'bg-emerald-500/10 border-white/5'}`}>
-                  <span className="text-[8px] font-black uppercase text-blue-200 flex items-center gap-1 mb-1 truncate italic"><Coffee size={10}/> PERSONAL</span>
-                  <span className={`text-sm font-black block truncate ${balances.personal < 0 ? 'text-red-200' : 'text-emerald-400'}`}>{formatMoney(balances.personal)}</span>
+                  <span className="text-[8px] font-black uppercase text-emerald-200 flex items-center gap-1 mb-1 truncate italic"><Coffee size={10}/> PERSONAL</span>
+                  <span className="text-sm font-black block">{formatMoney(balances.personal)}</span>
                 </div>
              </div>
           </div>
 
           <div className="flex justify-between items-center pt-2 relative">
              <div className="text-left opacity-60">
-                <p className="text-[8px] font-black uppercase text-blue-300">Total en Banco</p>
+                <p className="text-[8px] font-black uppercase text-blue-300 italic">Total Banco Físico</p>
                 <p className="text-xl font-black">{formatMoney(balances.total)}</p>
              </div>
              <div className="flex gap-2">
-                <button onClick={() => { setFormType('transfer'); setShowForm(true); }} className="bg-blue-500/20 hover:bg-blue-500 text-white p-3 rounded-xl border border-blue-400/30 transition-all active:scale-95 shadow-sm">
-                  <ArrowLeftRight size={20} />
-                </button>
-                <button onClick={() => { setFormType('ingreso'); setShowForm(true); }} className="bg-green-500 text-white p-3 rounded-xl shadow-lg active:scale-95">
-                  <ArrowDownLeft size={20} />
-                </button>
-                <button onClick={() => { setFormType('gasto'); setShowForm(true); }} className="bg-red-500 text-white p-3 rounded-xl shadow-lg active:scale-95">
-                  <ArrowUpRight size={20} />
-                </button>
+                <button onClick={() => { setFormType('transfer'); setShowForm(true); }} className="bg-blue-500/20 text-white p-3 rounded-xl border border-blue-400/30 transition-all active:scale-95"><ArrowLeftRight size={20} /></button>
+                <button onClick={() => { setFormType('ingreso'); setShowForm(true); }} className="bg-green-500 text-white p-3 rounded-xl shadow-lg active:scale-95"><ArrowDownLeft size={20} /></button>
+                <button onClick={() => { setFormType('gasto'); setShowForm(true); }} className="bg-red-500 text-white p-3 rounded-xl shadow-lg active:scale-95"><ArrowUpRight size={20} /></button>
              </div>
           </div>
         </div>
 
-        {/* LISTADO Y DATA */}
-        <div className="flex-1 overflow-y-auto bg-gray-50 flex flex-col pb-24 no-scrollbar">
+        {/* LISTADO Y MÁQUINA DEL TIEMPO */}
+        <div className="flex-1 overflow-y-auto bg-gray-50 flex flex-col pb-24">
+          
+          {/* HOME */}
           {activeTab === 'home' && (
             <div className="p-4 space-y-4 animate-in fade-in duration-300">
-              <div className="flex gap-2 overflow-x-auto pb-1 no-scrollbar sticky top-0 bg-gray-50 z-10 py-1">
+              <div className="flex gap-2 overflow-x-auto pb-1 sticky top-0 bg-gray-50 z-10 py-1">
                 <button onClick={() => setFilterBucket('ALL')} className={`shrink-0 px-4 py-2 rounded-full text-[10px] font-black uppercase transition-all ${filterBucket === 'ALL' ? 'bg-gray-800 text-white shadow-md' : 'bg-white text-gray-400 border border-gray-100'}`}>TODOS</button>
                 {BUCKETS.map(b => (
                   <button key={b.id} onClick={() => setFilterBucket(b.id)} className={`shrink-0 px-4 py-2 rounded-full text-[10px] font-black uppercase flex items-center gap-2 transition-all ${filterBucket === b.id ? 'bg-[#002A8D] text-white shadow-md' : 'bg-white text-gray-400 border border-gray-100'}`}>
-                    {b.icon} {b.label.split(' ')[0]}
+                    {b.icon} {b.label}
                   </button>
                 ))}
               </div>
@@ -319,7 +291,7 @@ export default function BilleteraApp() {
                         {tx.type === 'gasto' ? '- ' : '+ '}{formatMoney(tx.amount)}
                       </p>
                     </div>
-                    <button onClick={() => toggleAnular(tx.id, tx.status)} className="absolute -right-1 -top-1 bg-white rounded-full p-1.5 shadow-md border border-gray-100 text-gray-300 hover:text-red-400 transition-colors">
+                    <button onClick={() => toggleAnular(tx.id, tx.status)} className="absolute -right-1 -top-1 bg-white rounded-full p-1.5 shadow-md border border-gray-100 text-gray-300">
                       {tx.status === 'anulado' ? <RotateCcw size={10} className="text-blue-500" /> : <Ban size={10} />}
                     </button>
                   </div>
@@ -328,50 +300,63 @@ export default function BilleteraApp() {
             </div>
           )}
 
+          {/* AUDITORÍA */}
           {activeTab === 'audit' && (
             <div className="p-4 space-y-4 animate-in slide-in-from-right-4 duration-300">
               <input type="date" value={auditDate} onChange={(e) => setAuditDate(e.target.value)} className="w-full p-4 bg-white border-2 border-[#002A8D]/10 rounded-2xl font-black text-sm uppercase text-center outline-none italic" />
               
-              <div className="bg-[#002A8D] p-6 rounded-3xl text-white text-center shadow-lg relative overflow-hidden">
-                 <p className="text-[10px] font-black uppercase text-blue-200 mb-1 tracking-widest italic">Saldo Total al {formatDate(auditDate)}</p>
+              <div className={`p-6 rounded-3xl text-white text-center shadow-lg relative overflow-hidden transition-colors ${auditResult.isFuture ? 'bg-gray-600 animate-pulse' : 'bg-[#002A8D]'}`}>
+                 {auditResult.isFuture && <div className="absolute top-2 right-4 text-[7px] font-black bg-white/20 px-2 py-1 rounded-full italic tracking-widest">FECHA FUTURA</div>}
+                 <p className="text-[10px] font-black uppercase text-blue-200 mb-1 tracking-widest italic">Saldo histórico al {formatDate(auditDate)}</p>
                  <p className="text-3xl font-black tracking-tighter">{formatMoney(auditResult.history.total)}</p>
                  <div className="grid grid-cols-3 gap-1 mt-4 border-t border-white/10 pt-4">
-                    <div className="text-[8px] font-black uppercase italic">R: {formatMoney(auditResult.history.rafael)}</div>
                     <div className="text-[8px] font-black uppercase italic">C: {formatMoney(auditResult.history.cano)}</div>
+                    <div className="text-[8px] font-black uppercase italic">R: {formatMoney(auditResult.history.rafael)}</div>
                     <div className="text-[8px] font-black uppercase italic">P: {formatMoney(auditResult.history.personal)}</div>
                  </div>
               </div>
 
+              <div className="flex gap-2 overflow-x-auto">
+                <button onClick={() => setAuditFilterBucket('ALL')} className={`shrink-0 px-4 py-2 rounded-full text-[8px] font-black uppercase transition-all ${auditFilterBucket === 'ALL' ? 'bg-gray-800 text-white' : 'bg-white text-gray-400 border border-gray-100'}`}>TODOS</button>
+                {BUCKETS.map(b => (
+                  <button key={b.id} onClick={() => setAuditFilterBucket(b.id)} className={`shrink-0 px-4 py-2 rounded-full text-[8px] font-black uppercase flex items-center gap-1 transition-all ${auditFilterBucket === b.id ? 'bg-[#002A8D] text-white shadow-sm' : 'bg-white text-gray-400 border border-gray-100'}`}>
+                    {b.label}
+                  </button>
+                ))}
+              </div>
+
               <div className="space-y-2">
-                 <h2 className="text-[10px] font-black uppercase text-gray-400 tracking-widest px-1 italic">Movimientos del día</h2>
+                 <h2 className="text-[10px] font-black uppercase text-gray-400 tracking-widest px-1 italic">
+                    {auditResult.isFuture ? 'Sin datos reales todavía' : 'Actividad del día'}
+                 </h2>
                  {auditResult.list.map(tx => (
                    <div key={tx.id} className={`bg-white p-3 rounded-xl border flex justify-between items-center text-[10px] font-bold uppercase ${tx.status === 'anulado' ? 'opacity-30 line-through' : ''}`}>
-                      <span className="truncate pr-2">{tx.entity} ({tx.bucket?.split('_')[0]})</span>
+                      <span className="truncate pr-2 italic">{tx.entity} ({tx.bucket?.split('_')[1] || tx.bucket})</span>
                       <span className={`shrink-0 font-black ${tx.type === 'gasto' ? 'text-red-500' : 'text-green-600'}`}>
                          {tx.type === 'gasto' ? '- ' : '+ '}{formatMoney(tx.amount)}
                       </span>
                    </div>
                  ))}
-                 {auditResult.list.length === 0 && <p className="text-center py-10 italic text-[10px] font-black uppercase text-gray-300">Sin actividad hoy</p>}
               </div>
             </div>
           )}
 
+          {/* ESTADÍSTICAS */}
           {activeTab === 'stats' && (
             <div className="p-6 space-y-6 animate-in zoom-in-95 duration-300">
               <div className="bg-white rounded-[2.5rem] p-8 shadow-sm border border-gray-100">
-                <h3 className="text-2xl font-black text-gray-900 mb-8 uppercase tracking-tighter italic leading-none">Resumen de<br/>Utilidades</h3>
+                <h3 className="text-2xl font-black text-gray-900 mb-8 uppercase tracking-tighter italic leading-none">Cierre de<br/>Cajas</h3>
                 <div className="space-y-4">
-                   <div className="bg-blue-50 p-5 rounded-3xl border border-blue-100">
-                      <p className="text-[10px] font-black text-blue-800 uppercase mb-2 tracking-widest italic">Negocio Rafael (Utilidad)</p>
-                      <p className="text-2xl font-black text-blue-900 leading-none">{formatMoney(balances.rafael)}</p>
-                   </div>
                    <div className="bg-orange-50 p-5 rounded-3xl border border-orange-100">
-                      <p className="text-[10px] font-black text-orange-800 uppercase mb-2 tracking-widest italic">Negocio Cano (Capital)</p>
+                      <p className="text-[10px] font-black text-orange-800 uppercase mb-2 tracking-widest italic leading-none">Cano (Capital)</p>
                       <p className="text-2xl font-black text-orange-900 leading-none">{formatMoney(balances.cano)}</p>
                    </div>
+                   <div className="bg-blue-50 p-5 rounded-3xl border border-blue-100">
+                      <p className="text-[10px] font-black text-blue-800 uppercase mb-2 tracking-widest italic leading-none">Rafael (Utilidad)</p>
+                      <p className="text-2xl font-black text-blue-900 leading-none">{formatMoney(balances.rafael)}</p>
+                   </div>
                    <div className={`p-5 rounded-3xl border ${balances.personal < 0 ? 'bg-red-50 border-red-100' : 'bg-emerald-50 border-emerald-100'}`}>
-                      <p className="text-[10px] font-black uppercase mb-2 tracking-widest italic">Bolsillo Personal</p>
+                      <p className="text-[10px] font-black uppercase mb-2 tracking-widest italic leading-none">Personal (Gasto)</p>
                       <p className={`text-2xl font-black leading-none ${balances.personal < 0 ? 'text-red-600' : 'text-emerald-700'}`}>{formatMoney(balances.personal)}</p>
                    </div>
                 </div>
@@ -380,16 +365,16 @@ export default function BilleteraApp() {
           )}
         </div>
 
-        {/* NAVEGACIÓN INFERIOR */}
+        {/* NAVEGACIÓN */}
         <div className="bg-white border-t border-gray-100 flex justify-around py-4 pb-8 absolute bottom-0 w-full z-20 shadow-[0_-10px_30px_rgba(0,0,0,0.05)]">
           <button onClick={() => setActiveTab('home')} className={`flex flex-col items-center gap-1 transition-all ${activeTab === 'home' ? 'text-[#002A8D] scale-110' : 'text-gray-400 opacity-50'}`}>
             <Home size={22} /><span className="text-[9px] font-black uppercase italic">Flujo</span>
           </button>
           <button onClick={() => setActiveTab('audit')} className={`flex flex-col items-center gap-1 transition-all ${activeTab === 'audit' ? 'text-[#002A8D] scale-110' : 'text-gray-400 opacity-50'}`}>
-            <History size={22} /><span className="text-[9px] font-black uppercase italic">Data</span>
+            <History size={22} /><span className="text-[9px] font-black uppercase italic">Auditoría</span>
           </button>
           <button onClick={() => setActiveTab('stats')} className={`flex flex-col items-center gap-1 transition-all ${activeTab === 'stats' ? 'text-[#002A8D] scale-110' : 'text-gray-400 opacity-50'}`}>
-            <PieChart size={22} /><span className="text-[9px] font-black uppercase italic">Utilidad</span>
+            <PieChart size={22} /><span className="text-[9px] font-black uppercase italic">Cajas</span>
           </button>
         </div>
 
@@ -401,17 +386,17 @@ export default function BilleteraApp() {
                 <h3 className={`text-xl font-black uppercase italic ${formType === 'ingreso' ? 'text-green-600' : formType === 'gasto' ? 'text-red-600' : 'text-blue-600'}`}>
                   {formType === 'transfer' ? 'Efectuar Transferencia' : `Registrar ${formType === 'ingreso' ? 'Entrada' : 'Salida'}`}
                 </h3>
-                <button onClick={() => setShowForm(false)} className="bg-gray-100 rounded-full p-2"><X size={24}/></button>
+                <button onClick={() => setShowForm(false)} className="bg-gray-100 rounded-full p-2 hover:bg-gray-200 transition-colors"><X size={24}/></button>
               </div>
               <form onSubmit={handleSubmit} className="space-y-6">
                 
                 {formType === 'transfer' ? (
                   <div className="space-y-4">
-                     <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-2 leading-none">¿De qué caja sale?</p>
+                     <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-2 leading-none italic">¿De qué caja sale?</p>
                      <select value={formData.bucket} onChange={(e) => setFormData({...formData, bucket: e.target.value})} className="w-full p-5 bg-gray-50 border border-gray-100 rounded-2xl font-black uppercase text-xs outline-none">
                         {BUCKETS.map(b => <option key={b.id} value={b.id}>{b.label}</option>)}
                      </select>
-                     <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-2 leading-none">¿A qué caja entra?</p>
+                     <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-2 leading-none italic">¿A qué caja entra?</p>
                      <select value={formData.toBucket} onChange={(e) => setFormData({...formData, toBucket: e.target.value})} className="w-full p-5 bg-gray-50 border border-gray-100 rounded-2xl font-black uppercase text-xs outline-none">
                         {BUCKETS.map(b => <option key={b.id} value={b.id}>{b.label}</option>)}
                      </select>
@@ -434,9 +419,8 @@ export default function BilleteraApp() {
 
                 {formType !== 'transfer' && (
                   <div className="space-y-4">
-                    {/* Selector de Método Reintegrado */}
                     <div className="space-y-2">
-                       <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-2 leading-none">Medio de Pago:</p>
+                       <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-2 leading-none italic">Medio de Pago:</p>
                        <div className="grid grid-cols-2 gap-2">
                           {['YAPE', 'PLIN', 'TRANSF.', 'EFECTIVO'].map(m => (
                             <button key={m} type="button" onClick={() => setFormData({...formData, method: m})} className={`py-4 rounded-2xl border-2 text-[10px] font-black uppercase transition-all active:scale-95 ${formData.method === m ? 'bg-gray-800 text-white border-gray-800 shadow-md' : 'bg-white text-gray-400 border-gray-100'}`}>{m}</button>
@@ -444,7 +428,7 @@ export default function BilleteraApp() {
                        </div>
                     </div>
                     <input type="text" required value={formData.entity} onChange={(e) => setFormData({...formData, entity: e.target.value})} className="w-full bg-gray-50 border border-gray-100 rounded-2xl px-5 py-5 text-sm font-bold uppercase italic outline-none focus:border-[#002A8D]" placeholder="Nombre de Cliente / Proveedor / Personal" />
-                    <input type="text" required value={formData.concept} onChange={(e) => setFormData({...formData, concept: e.target.value})} className="w-full bg-gray-50 border border-gray-100 rounded-2xl px-5 py-5 text-sm font-bold uppercase italic outline-none focus:border-[#002A8D]" placeholder="Concepto Detallado (Ej. Pago 50 morrales)" />
+                    <input type="text" required value={formData.concept} onChange={(e) => setFormData({...formData, concept: e.target.value})} className="w-full bg-gray-50 border border-gray-100 rounded-2xl px-5 py-5 text-sm font-bold uppercase italic outline-none focus:border-[#002A8D]" placeholder="Concepto Detallado (Ej. Pago 50 maletines)" />
                   </div>
                 )}
                 
@@ -465,7 +449,7 @@ export default function BilleteraApp() {
                 {user?.photoURL ? <img src={user.photoURL} className="w-full h-full object-cover" /> : <UserCircle size={56} className="text-blue-200" />}
               </div>
               <h3 className="text-2xl font-black text-gray-900 mb-1 italic uppercase tracking-tighter leading-none">{user?.displayName || 'Admin Antcor'}</h3>
-              <p className="text-[10px] text-green-500 font-black uppercase mb-8 tracking-widest">Sincronización Cloud Activa</p>
+              <p className="text-[10px] text-green-500 font-black uppercase mb-8 tracking-widest italic">Sincronización Cloud Activa</p>
               <button onClick={handleSignOut} className="w-full text-red-500 font-black text-xs uppercase tracking-widest py-5 border-2 border-red-50 rounded-2xl hover:bg-red-50 transition-all active:scale-95">Cerrar Sesión</button>
             </div>
           </div>
